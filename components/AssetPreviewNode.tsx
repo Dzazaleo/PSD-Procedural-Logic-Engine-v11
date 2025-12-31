@@ -1,501 +1,324 @@
-import React, { memo, useEffect, useMemo, useState } from 'react';
-import { Handle, Position, NodeProps, NodeResizer, useEdges, useReactFlow, useUpdateNodeInternals, Edge } from 'reactflow';
-import { PSDNodeData, AssetPreviewInstanceState, TransformedPayload, PreviewMode, TransformedLayer, TemplateMetadata } from '../types';
+import React, { memo, useState, useEffect, useMemo, useRef } from 'react';
+import { Handle, Position, NodeProps, useEdges, useReactFlow } from 'reactflow';
+import { PSDNodeData, TransformedPayload, TransformedLayer, TemplateMetadata } from '../types';
 import { useProceduralStore } from '../store/ProceduralContext';
 import { findLayerByPath } from '../services/psdService';
-import { Eye, CheckCircle2, LayoutGrid, Box, Cpu, FileJson, ArrowRightLeft, Zap, Lock, AlertTriangle } from 'lucide-react';
-import { Psd, Layer } from 'ag-psd';
+import { Eye, CheckCircle2, Zap, Scan, Layers } from 'lucide-react';
 
-// --- Helper: Audit Badge ---
-const AuditBadge = ({ count, label, icon: Icon, colorClass }: { count: number, label: string, icon: any, colorClass: string }) => (
-    <div className={`flex items-center space-x-1.5 px-2 py-1 rounded border ${colorClass} bg-opacity-20`}>
-        <Icon className="w-3 h-3" />
-        <span className="text-[9px] font-mono font-bold">{count} {label}</span>
-    </div>
-);
-
-// --- Helper: Recursive Pixel Search ---
-// Fallback mechanism to find pixel data by name if strict path lookups fail due to structural mutations.
-const findPixelsRecursive = (children: Layer[] | undefined, targetName: string): HTMLCanvasElement | null => {
-    if (!children) return null;
-    for (const layer of children) {
-        if (layer.name === targetName && layer.canvas) {
-            return layer.canvas as HTMLCanvasElement;
-        }
-        if (layer.children) {
-            const found = findPixelsRecursive(layer.children, targetName);
-            if (found) return found;
-        }
-    }
-    return null;
-};
-
-// --- Interface Definition ---
 interface PreviewInstanceRowProps {
-    index: number;
-    nodeId: string;
-    state: AssetPreviewInstanceState;
-    edges: Edge[];
-    payloadRegistry: Record<string, Record<string, TransformedPayload>>;
-    reviewerRegistry: Record<string, Record<string, TransformedPayload>>;
-    psdRegistry: Record<string, Psd>;
-    templateRegistry: Record<string, TemplateMetadata>;
-    globalVersion: number;
-    onToggle: (index: number, mode: PreviewMode) => void;
+  nodeId: string;
+  index: number;
+  edges: any[];
 }
 
-// --- Subcomponent: Preview Instance Row ---
-const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({ 
-    index, 
-    nodeId, 
-    state, 
-    edges, 
-    payloadRegistry, 
-    reviewerRegistry, 
-    psdRegistry,
-    templateRegistry,
-    globalVersion,
-    onToggle 
-}) => {
-    // We use registerReviewerPayload to alias this node as a 'Reviewer' for the Export Node's strict gate
-    const { registerReviewerPayload } = useProceduralStore();
-    const [localPreview, setLocalPreview] = useState<string | null>(null);
-    const [renderError, setRenderError] = useState<string | null>(null);
+const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({ nodeId, index, edges }) => {
+  const [viewMode, setViewMode] = useState<'PROCEDURAL' | 'POLISHED'>('PROCEDURAL');
+  const [localPreview, setLocalPreview] = useState<string | null>(null);
+  
+  // Store Access
+  const { payloadRegistry, reviewerRegistry, psdRegistry, registerReviewerPayload, templateRegistry, globalVersion } = useProceduralStore();
+
+  // 1. Resolve Inputs
+  const inputEdge = edges.find(e => e.target === nodeId && e.targetHandle === `payload-in-${index}`);
+  
+  const polishedPayload = inputEdge && reviewerRegistry[inputEdge.source] 
+    ? reviewerRegistry[inputEdge.source][inputEdge.sourceHandle || ''] 
+    : undefined;
+
+  const proceduralPayload = useMemo(() => {
+    if (!polishedPayload && inputEdge && payloadRegistry[inputEdge.source]) {
+        return payloadRegistry[inputEdge.source][inputEdge.sourceHandle || ''];
+    }
+    if (!polishedPayload) return undefined;
     
-    // 1. Trace Upstream (Reviewer Connection)
-    const upstreamEdge = useMemo(() => 
-        edges.find((e) => e.target === nodeId && e.targetHandle === `payload-in-${index}`),
-    [edges, nodeId, index]);
+    // Fallback: Find matching procedural payload by container name
+    const sourceId = polishedPayload.sourceNodeId;
+    const registry = payloadRegistry[sourceId] || {};
+    const allPayloads = Object.values(registry) as TransformedPayload[];
+    return allPayloads.find(p => p.targetContainer === polishedPayload.targetContainer);
+  }, [polishedPayload, payloadRegistry, inputEdge]);
 
-    // 2. Resolve Polished Payload (Directly from the connected Reviewer)
-    const polishedPayload: TransformedPayload | undefined = useMemo(() => {
-        if (!upstreamEdge) return undefined;
-        return reviewerRegistry[upstreamEdge.source]?.[upstreamEdge.sourceHandle || ''];
-    }, [upstreamEdge, reviewerRegistry]);
+  const isPolishedAvailable = !!polishedPayload && !!polishedPayload.isPolished;
+  const effectiveMode = (viewMode === 'POLISHED' && isPolishedAvailable) ? 'POLISHED' : 'PROCEDURAL';
+  const displayPayload = effectiveMode === 'POLISHED' ? polishedPayload : (polishedPayload || proceduralPayload);
 
-    // 3. Resolve Procedural Payload (Trace back to the Grandparent Remapper)
-    const proceduralPayload: TransformedPayload | undefined = useMemo(() => {
-        if (!upstreamEdge) return undefined;
+  // 4. Broadcast Selection
+  useEffect(() => {
+    if (displayPayload) {
+      registerReviewerPayload(nodeId, `preview-out-${index}`, { ...displayPayload, isPolished: true });
+    }
+  }, [displayPayload, nodeId, index, registerReviewerPayload]);
 
-        const upstreamInputHandle = upstreamEdge.sourceHandle?.replace('polished-out', 'payload-in');
-        
-        if (upstreamInputHandle) {
-            const grandparentEdge = edges.find(
-                e => e.target === upstreamEdge.source && e.targetHandle === upstreamInputHandle
-            );
-            
-            if (grandparentEdge) {
-                return payloadRegistry[grandparentEdge.source]?.[grandparentEdge.sourceHandle || ''];
-            }
+  // 5. AUTO-FRAMING COMPOSITOR
+  useEffect(() => {
+    if (!displayPayload) return;
+
+    console.log("[Preview] Starting render for:", displayPayload.targetContainer, "Source Node:", displayPayload.sourceNodeId);
+
+    const sourcePsd = psdRegistry[displayPayload.sourceNodeId];
+    const { w, h } = displayPayload.metrics.target;
+    
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    // A. Background (Dark Slate)
+    ctx.fillStyle = '#0f172a';
+    ctx.fillRect(0, 0, w, h);
+
+    // B. Calculate Origin (The "Camera" Position)
+    let originX = 0;
+    let originY = 0;
+    let originFound = false;
+
+    // Strategy 1: Metadata Lookup (Case-Insensitive)
+    const allTemplates = Object.values(templateRegistry) as TemplateMetadata[];
+    for (const tmpl of allTemplates) {
+        const container = tmpl.containers.find(c => 
+            c.name.toLowerCase() === displayPayload.targetContainer.toLowerCase()
+        );
+        if (container) {
+            originX = container.bounds.x;
+            originY = container.bounds.y;
+            originFound = true;
+            break;
         }
-        
-        return payloadRegistry[upstreamEdge.source]?.[upstreamEdge.sourceHandle || ''];
-
-    }, [upstreamEdge, edges, payloadRegistry]);
-
-    // 4. Select Active Payload based on State Selection
-    const activeMode = state.currentMode;
-    let displayPayload: TransformedPayload | undefined;
-    
-    if (activeMode === 'POLISHED') {
-        displayPayload = polishedPayload;
-    } else {
-        displayPayload = proceduralPayload;
     }
 
-    const isPolishedAvailable = !!polishedPayload;
-    const isProceduralAvailable = !!proceduralPayload;
-
-    // 5. Broadcast "Production Gate" Selection
-    useEffect(() => {
-        if (displayPayload) {
-            const signedOffPayload = { ...displayPayload, isPolished: true };
-            registerReviewerPayload(nodeId, `preview-out-${index}`, signedOffPayload);
-        }
-    }, [displayPayload, nodeId, index, registerReviewerPayload]);
-
-    // 6. SURGICAL COMPOSITOR LOGIC
-    useEffect(() => {
-        if (!displayPayload) {
-            setLocalPreview(null);
-            setRenderError(null);
-            return;
-        }
-
-        const sourceNodeId = displayPayload.sourceNodeId;
-        const psd = psdRegistry[sourceNodeId];
-
-        // BINARY READINESS GATE
-        // If the registry entry is missing (e.g. during re-upload), abort update to prevent blanking out the canvas.
-        if (!psd) {
-            // Fallback: If we have an AI preview URL, display it, otherwise keep previous state if possible.
-            if (displayPayload.previewUrl) {
-                setLocalPreview(displayPayload.previewUrl);
-            }
-            return; 
-        }
-
-        const { w, h } = displayPayload.metrics.target;
-        if (w === 0 || h === 0) return;
-
-        // --- COORDINATE NORMALIZATION ---
-        let originX = 0;
-        let originY = 0;
-        let foundContainer = false;
-
-        const allTemplates = Object.values(templateRegistry) as TemplateMetadata[];
+    // Strategy 2: Auto-Frame (Fallback)
+    // If metadata fails, find the top-leftmost layer and use that as the origin anchor
+    if (!originFound && displayPayload.layers.length > 0) {
+        let minX = Infinity;
+        let minY = Infinity;
         
-        for (const tmpl of allTemplates) {
-            const cont = tmpl.containers.find(c => c.name === displayPayload?.targetContainer);
-            if (cont) {
-                originX = cont.bounds.x;
-                originY = cont.bounds.y;
-                foundContainer = true;
-                break;
-            }
+        const scanLayers = (layers: TransformedLayer[]) => {
+            layers.forEach(l => {
+                if (l.coords.x < minX) minX = l.coords.x;
+                if (l.coords.y < minY) minY = l.coords.y;
+                if (l.children) scanLayers(l.children);
+            });
+        };
+        scanLayers(displayPayload.layers);
+        
+        if (minX !== Infinity) {
+            originX = minX;
+            originY = minY;
+            console.warn(`[AssetPreview] Metadata lookup failed for ${displayPayload.targetContainer}. Auto-framed to ${minX}, ${minY}`);
         }
+    }
 
-        // Fallback Guess logic remains same...
-        if (!foundContainer && displayPayload.layers.length > 0) {
-            let minX = Infinity;
-            let minY = Infinity;
-            const findMin = (layers: TransformedLayer[]) => {
-                layers.forEach(l => {
-                    if (l.isVisible) {
-                        if (l.coords.x < minX) minX = l.coords.x;
-                        if (l.coords.y < minY) minY = l.coords.y;
-                        if (l.children) findMin(l.children);
-                    }
-                });
-            };
-            findMin(displayPayload.layers);
-            if (minX !== Infinity) originX = minX;
-            if (minY !== Infinity) originY = minY;
-        }
+    // Debug Grid
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
+    ctx.beginPath();
+    ctx.moveTo(0, 0); ctx.lineTo(w, h);
+    ctx.moveTo(w, 0); ctx.lineTo(0, h);
+    ctx.stroke();
 
-        const canvas = document.createElement('canvas');
-        canvas.width = w;
-        canvas.height = h;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) return;
+    // C. Draw Loop
+    const drawLayers = (layers: TransformedLayer[]) => {
+        // Bottom-up traversal
+        for (let i = layers.length - 1; i >= 0; i--) {
+            const layer = layers[i];
+            
+            if (layer.isVisible) {
+                // Shift Global Coordinates to Local Canvas Space
+                const localX = layer.coords.x - originX;
+                const localY = layer.coords.y - originY;
 
-        // Background: Solid Dark Slate
-        ctx.fillStyle = '#0f172a';
-        ctx.fillRect(0, 0, w, h);
-
-        const drawLayers = (layers: TransformedLayer[]) => {
-            // Reverse Painter's Algorithm (Bottom-Up)
-            for (let i = layers.length - 1; i >= 0; i--) {
-                const layer = layers[i];
-                if (!layer.isVisible) continue;
-
-                if (layer.children) {
-                    drawLayers(layer.children);
-                }
-
-                // --- STRICT TRANSFORMATION BANKING ---
                 ctx.save();
                 
+                // 1. Generative Placeholder
                 if (layer.type === 'generative') {
-                    // Normalize Coordinates relative to Origin
-                    const localX = layer.coords.x - originX;
-                    const localY = layer.coords.y - originY;
-
-                    ctx.fillStyle = 'rgba(192, 132, 252, 0.2)';
-                    ctx.strokeStyle = 'rgba(192, 132, 252, 0.6)';
+                    ctx.fillStyle = 'rgba(192, 132, 252, 0.2)'; // Purple
+                    ctx.strokeStyle = '#c084fc';
                     ctx.setLineDash([4, 4]);
-                    ctx.lineWidth = 1;
                     ctx.fillRect(localX, localY, layer.coords.w, layer.coords.h);
                     ctx.strokeRect(localX, localY, layer.coords.w, layer.coords.h);
-                } else {
-                    // 1. Primary Lookup: Path ID (Fastest)
-                    const directLayer = findLayerByPath(psd, layer.id);
-                    let pixelSource: HTMLCanvasElement | null = null;
+                } 
+                // 2. Pixel Layer
+                else if (sourcePsd) {
+                    const originalLayer = findLayerByPath(sourcePsd, layer.id);
 
-                    if (directLayer && directLayer.canvas) {
-                        pixelSource = directLayer.canvas as HTMLCanvasElement;
-                    } else {
-                        // 2. Fallback Lookup: Recursive Name Search (Robustness for partial structure matches)
-                        pixelSource = findPixelsRecursive(psd.children, layer.name);
-                    }
-
-                    if (pixelSource) {
-                        // Normalization & Transform Application
+                    if (originalLayer && originalLayer.canvas) {
                         ctx.globalAlpha = layer.opacity;
                         
-                        // Move context to where the top-left of the layer should be
-                        ctx.translate(layer.coords.x - originX, layer.coords.y - originY);
-                        
+                        // Apply Transforms
                         if (layer.transform.rotation) {
-                            // Rotate around center? No, standard CSS/Canvas transform usually assumes top-left unless offset.
-                            // However, our data model usually stores top-left.
-                            // For simple rotation, we rotate around the center of the object.
-                            const cx = layer.coords.w / 2;
-                            const cy = layer.coords.h / 2;
-                            ctx.translate(cx, cy);
-                            ctx.rotate((layer.transform.rotation * Math.PI) / 180);
-                            ctx.translate(-cx, -cy);
+                             const cx = localX + layer.coords.w / 2;
+                             const cy = localY + layer.coords.h / 2;
+                             ctx.translate(cx, cy);
+                             ctx.rotate((layer.transform.rotation * Math.PI) / 180);
+                             ctx.translate(-cx, -cy);
                         }
 
-                        // Draw at (0,0) relative to the translated context
-                        ctx.drawImage(pixelSource, 0, 0, layer.coords.w, layer.coords.h);
+                        // Draw Image
+                        try {
+                            ctx.drawImage(
+                                originalLayer.canvas, 
+                                localX, 
+                                localY, 
+                                layer.coords.w, 
+                                layer.coords.h
+                            );
+                        } catch (e) { /* Ignore empty canvas errors */ }
                     } else {
-                        // 3. Debug Wireframe (Missing Pixels)
-                        const localX = layer.coords.x - originX;
-                        const localY = layer.coords.y - originY;
-                        
-                        ctx.strokeStyle = '#fbbf24'; // Amber-400
-                        ctx.lineWidth = 1;
-                        ctx.setLineDash([2, 2]);
+                        // Binary Missing Indicator
+                        ctx.strokeStyle = '#ef4444'; // Red
+                        ctx.lineWidth = 2;
                         ctx.strokeRect(localX, localY, layer.coords.w, layer.coords.h);
-                        
-                        if (layer.coords.h > 12) {
-                            ctx.fillStyle = '#fbbf24';
-                            ctx.font = '9px monospace';
-                            ctx.fillText(`[MISSING: ${layer.name.substring(0, 10)}]`, localX + 2, localY + 10);
-                        }
                     }
                 }
 
                 ctx.restore();
+
+                if (layer.children) {
+                    drawLayers(layer.children);
+                }
             }
-        };
+        }
+    };
 
+    if (displayPayload.layers) {
         drawLayers(displayPayload.layers);
+    }
 
-        const url = canvas.toDataURL('image/jpeg', 0.9);
-        setLocalPreview(url);
-        setRenderError(null);
+    // D. Finalize
+    setLocalPreview(canvas.toDataURL('image/jpeg', 0.85));
 
-    }, [displayPayload, psdRegistry, templateRegistry, globalVersion]);
+  }, [displayPayload, psdRegistry, templateRegistry, globalVersion]);
 
-
-    // Stats Calculation
-    const dims = displayPayload?.metrics?.target || { w: 0, h: 0 };
-    const scale = displayPayload?.scaleFactor || 1;
-
-    const breakdown = useMemo(() => {
-        let pixel = 0, group = 0, gen = 0;
-        const traverse = (layers: any[]) => {
-            layers.forEach(l => {
-                if (l.type === 'generative') gen++;
-                else if (l.type === 'group') group++;
-                else pixel++;
-                if (l.children) traverse(l.children);
-            });
-        };
-        if (displayPayload?.layers) traverse(displayPayload.layers);
-        return { pixel, group, gen };
-    }, [displayPayload]);
-
-    return (
-        <div className="p-3 bg-slate-800/50 border-b border-emerald-900/30 space-y-3">
-             {/* Header / Connection Status */}
-             <div className="flex items-center justify-between">
-                <div className="flex items-center space-x-2">
-                    <Handle 
-                        type="target" 
-                        position={Position.Left} 
-                        id={`payload-in-${index}`} 
-                        className={`!static !w-2.5 !h-2.5 !border-2 ${upstreamEdge ? '!bg-indigo-500 !border-white' : '!bg-slate-700 !border-slate-500'}`} 
-                    />
-                    <span className="text-[10px] font-bold text-slate-300 uppercase tracking-wider">
-                        {upstreamEdge ? (displayPayload?.targetContainer || 'Connected') : 'Connect Reviewer'}
-                    </span>
-                </div>
-                {displayPayload && (
-                    <span className="text-[9px] font-mono text-slate-500">
-                        {Math.round(dims.w)}x{Math.round(dims.h)} • {scale.toFixed(2)}x
-                    </span>
-                )}
-             </div>
-
-             {/* Semantic Toggle */}
-             <div className="flex bg-slate-900 p-1 rounded border border-slate-700">
-                 <button
-                    onClick={() => onToggle(index, 'PROCEDURAL')}
-                    disabled={!isProceduralAvailable}
-                    className={`flex-1 py-1.5 text-[9px] font-bold uppercase tracking-wider rounded flex items-center justify-center space-x-1 transition-all ${
-                        state.currentMode === 'PROCEDURAL' 
-                            ? 'bg-indigo-600 text-white shadow-sm' 
-                            : 'text-slate-500 hover:text-slate-300'
-                    } ${!isProceduralAvailable ? 'opacity-30 cursor-not-allowed' : ''}`}
-                 >
-                     <LayoutGrid className="w-3 h-3" />
-                     <span>Procedural</span>
-                 </button>
-                 
-                 <div className="w-px bg-slate-700 mx-1"></div>
-
-                 <button
-                    onClick={() => onToggle(index, 'POLISHED')}
+  return (
+    <div className="relative border-b border-emerald-900/30 bg-slate-950/50 p-3 space-y-3">
+        {/* Header */}
+        <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center space-x-2">
+                <div className={`w-2 h-2 rounded-full ${isPolishedAvailable ? 'bg-emerald-500' : 'bg-blue-500'}`}></div>
+                <span className="text-[11px] font-bold text-slate-200 uppercase tracking-wider truncate max-w-[150px]">
+                    {displayPayload?.targetContainer || `SLOT ${index}`}
+                </span>
+            </div>
+            
+            {/* Toggle */}
+            <div className="flex bg-slate-900 rounded p-0.5 border border-slate-700">
+                <button
+                    onClick={() => setViewMode('PROCEDURAL')}
+                    className={`px-3 py-1 rounded text-[9px] font-bold uppercase transition-all ${
+                        effectiveMode === 'PROCEDURAL' 
+                        ? 'bg-indigo-600 text-white shadow-sm' 
+                        : 'text-slate-500 hover:text-slate-300'
+                    }`}
+                >
+                    <Zap className="w-3 h-3 inline mr-1" />
+                    Procedural
+                </button>
+                <button
+                    onClick={() => setViewMode('POLISHED')}
                     disabled={!isPolishedAvailable}
-                    className={`flex-1 py-1.5 text-[9px] font-bold uppercase tracking-wider rounded flex items-center justify-center space-x-1 transition-all ${
-                        state.currentMode === 'POLISHED' 
-                            ? 'bg-emerald-600 text-white shadow-sm' 
-                            : 'text-slate-500 hover:text-slate-300'
-                    } ${!isPolishedAvailable ? 'opacity-30 cursor-not-allowed bg-slate-800' : ''}`}
-                    title={!isPolishedAvailable ? "Audit Pending: No polished payload available yet" : "View Final CARO Output"}
-                 >
-                     {isPolishedAvailable ? <CheckCircle2 className="w-3 h-3" /> : <Lock className="w-3 h-3" />}
-                     <span>Polished</span>
-                 </button>
-             </div>
+                    className={`px-3 py-1 rounded text-[9px] font-bold uppercase transition-all ${
+                        effectiveMode === 'POLISHED' 
+                        ? 'bg-emerald-600 text-white shadow-sm' 
+                        : 'text-slate-600 cursor-not-allowed opacity-50'
+                    }`}
+                >
+                    <CheckCircle2 className="w-3 h-3 inline mr-1" />
+                    Polished
+                </button>
+            </div>
+        </div>
 
-             {/* Visualization Area */}
-             <div className="relative w-full h-48 bg-[#0f172a] rounded border-2 border-dashed border-slate-600/50 overflow-hidden flex items-center justify-center shadow-inner group">
-                 {/* Checkerboard Pattern (Only visible if image has transparency, but we use solid bg now) */}
-                 <div className="absolute inset-0 opacity-5 pointer-events-none" 
-                      style={{ backgroundImage: 'linear-gradient(45deg, #444 25%, transparent 25%), linear-gradient(-45deg, #444 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #444 75%), linear-gradient(-45deg, transparent 75%, #444 75%)', backgroundSize: '20px 20px', backgroundPosition: '0 0, 0 10px, 10px -10px, -10px 0px' }} 
-                 />
+        {/* Canvas Stage */}
+        <div className="relative w-full aspect-video bg-[#0f172a] rounded border border-slate-700/50 overflow-hidden flex items-center justify-center group">
+            {/* Checkerboard */}
+            <div className="absolute inset-0 opacity-10 pointer-events-none" 
+                 style={{ backgroundImage: 'radial-gradient(#334155 1px, transparent 1px)', backgroundSize: '10px 10px' }}>
+            </div>
 
-                 {!displayPayload && !renderError ? (
-                     <div className="text-xs text-neutral-500 font-mono">Waiting for Payload...</div>
-                 ) : renderError ? (
-                     <div className="flex flex-col items-center justify-center text-red-400 p-4 text-center space-y-2">
-                         <AlertTriangle className="w-6 h-6" />
-                         <span className="text-[10px] font-mono">{renderError}</span>
-                     </div>
-                 ) : (
-                     <div className="relative w-full h-full p-4 flex items-center justify-center">
-                         {/* Composited Preview or Fallback */}
-                         {localPreview ? (
-                             <img src={localPreview} alt="Composited Preview" className="max-w-full max-h-full object-contain shadow-lg" />
-                         ) : (
-                             // Fallback if rendering takes time
-                             <div className="flex flex-col items-center gap-1 text-neutral-500 animate-pulse">
-                                <Zap className="w-4 h-4" />
-                                <span className="text-[9px]">Synthesizing...</span>
-                             </div>
-                         )}
-                         
-                         {/* Status Overlay */}
-                         <div className="absolute bottom-2 right-2 flex space-x-1">
-                             <span className={`text-[8px] px-1.5 py-0.5 rounded font-bold uppercase backdrop-blur-md shadow-sm border ${
-                                 state.currentMode === 'POLISHED' 
-                                     ? 'bg-emerald-500/80 text-white border-emerald-400' 
-                                     : 'bg-indigo-500/80 text-white border-indigo-400'
-                             }`}>
-                                 {state.currentMode} VIEW
-                             </span>
-                         </div>
-                     </div>
-                 )}
-             </div>
+            {localPreview ? (
+                <img 
+                    src={localPreview} 
+                    alt="Preview" 
+                    className="max-w-full max-h-full object-contain shadow-2xl"
+                />
+            ) : (
+                <div className="flex flex-col items-center text-slate-600 space-y-2">
+                    <Eye className="w-6 h-6 opacity-50" />
+                    <span className="text-[9px] uppercase tracking-widest opacity-50">Rendering...</span>
+                </div>
+            )}
 
-             {/* Process Audit Footer */}
-             {displayPayload && (
-                 <div className="flex flex-wrap gap-2 pt-1">
-                     <AuditBadge count={breakdown.pixel} label="Pixel" icon={FileJson} colorClass="bg-slate-700 border-slate-600 text-slate-300" />
-                     <AuditBadge count={breakdown.group} label="Groups" icon={Box} colorClass="bg-slate-700 border-slate-600 text-slate-300" />
-                     {breakdown.gen > 0 && (
-                         <AuditBadge count={breakdown.gen} label="AI Gen" icon={Cpu} colorClass="bg-purple-900 border-purple-500 text-purple-300" />
-                     )}
-                 </div>
-             )}
+            {/* Stats Overlay */}
+            <div className="absolute bottom-2 right-2 flex gap-1">
+                <div className="bg-black/60 backdrop-blur text-slate-300 text-[8px] px-1.5 py-0.5 rounded border border-white/10 font-mono">
+                   {displayPayload ? `${displayPayload.metrics.target.w}x${displayPayload.metrics.target.h}` : 'N/A'}
+                </div>
+            </div>
+        </div>
 
-             {/* Output Handle */}
-             <div className="flex justify-end pt-1 relative">
-                 <div className="flex items-center space-x-1 pr-2">
-                     <span className="text-[9px] text-emerald-500 font-bold tracking-widest uppercase">To Export</span>
-                     <ArrowRightLeft className="w-3 h-3 text-emerald-600" />
-                 </div>
-                 <Handle 
+        {/* Footer */}
+        <div className="flex items-center justify-between px-1">
+            <div className="flex items-center space-x-2 text-[9px] text-slate-500 font-mono">
+                <Layers className="w-3 h-3" />
+                <span>{displayPayload?.layers.length || 0} Objects</span>
+            </div>
+            
+            <div className="relative">
+                <span className="text-[7px] text-emerald-600 font-bold tracking-widest uppercase mr-4">TO EXPORT</span>
+                <Handle 
                     type="source" 
                     position={Position.Right} 
                     id={`preview-out-${index}`} 
-                    className={`!absolute !right-[-12px] !top-1/2 !-translate-y-1/2 !w-3 !h-3 !border-2 ${displayPayload ? '!bg-emerald-500 !border-white' : '!bg-slate-700 !border-slate-500'}`} 
-                 />
-             </div>
+                    className="!absolute !right-[-8px] !top-1/2 !-translate-y-1/2 !w-3 !h-3 !bg-emerald-400 !border-2 !border-slate-900 z-50" 
+                />
+            </div>
         </div>
-    );
+        
+        {/* Input Handle */}
+        <Handle 
+            type="target" 
+            position={Position.Left} 
+            id={`payload-in-${index}`} 
+            className="!absolute !left-[-8px] !top-1/2 !-translate-y-1/2 !w-3 !h-3 !bg-indigo-500 !border-2 !border-slate-900 z-50" 
+        />
+    </div>
+  );
 };
 
 export const AssetPreviewNode = memo(({ id, data }: NodeProps<PSDNodeData>) => {
-  const instanceCount = data.instanceCount || 1;
-  const previewInstances = data.previewInstances || {};
-  
+  const [instanceCount, setInstanceCount] = useState(data.instanceCount || 1);
   const { setNodes } = useReactFlow();
-  const updateNodeInternals = useUpdateNodeInternals();
   const edges = useEdges();
-  
-  // Store Access
-  const { 
-      payloadRegistry, 
-      reviewerRegistry, 
-      psdRegistry, 
-      templateRegistry, 
-      unregisterNode,
-      globalVersion 
-  } = useProceduralStore();
 
-  useEffect(() => {
-    updateNodeInternals(id);
-  }, [id, instanceCount, updateNodeInternals]);
-
-  useEffect(() => {
-    return () => unregisterNode(id);
-  }, [id, unregisterNode]);
-
-  const handleToggle = (index: number, mode: PreviewMode) => {
-      setNodes((nds) => nds.map((n) => {
-          if (n.id === id) {
-              const currentInstances = n.data.previewInstances || {};
-              return {
-                  ...n,
-                  data: {
-                      ...n.data,
-                      previewInstances: {
-                          ...currentInstances,
-                          [index]: { currentMode: mode }
-                      }
-                  }
-              };
-          }
-          return n;
-      }));
-  };
-
-  const addInstance = () => {
-      setNodes((nds) => nds.map((n) => n.id === id ? { ...n, data: { ...n.data, instanceCount: instanceCount + 1 } } : n));
+  const addSlot = () => {
+    const newCount = instanceCount + 1;
+    setInstanceCount(newCount);
+    setNodes(nds => nds.map(n => n.id === id ? { ...n, data: { ...n.data, instanceCount: newCount } } : n));
   };
 
   return (
-    <div className="w-[420px] bg-slate-900 rounded-lg shadow-2xl border border-emerald-500/30 font-sans flex flex-col overflow-hidden">
-      <NodeResizer minWidth={420} minHeight={300} isVisible={true} lineStyle={{ border: 'none' }} handleStyle={{ background: 'transparent' }} />
-      
-      {/* Header */}
-      <div className="bg-emerald-950/90 p-2 border-b border-emerald-500/50 flex items-center justify-between">
+    <div className="w-[420px] bg-slate-900 rounded-lg shadow-2xl border border-emerald-500/30 font-sans flex flex-col">
+      <div className="bg-emerald-950/50 p-2 border-b border-emerald-500/20 flex items-center justify-between">
          <div className="flex items-center space-x-2">
-           <Eye className="w-4 h-4 text-emerald-400" />
+           <Scan className="w-4 h-4 text-emerald-400" />
            <div className="flex flex-col leading-none">
-             <span className="text-sm font-bold text-emerald-100 tracking-tight">Asset Preview</span>
-             <span className="text-[9px] text-emerald-500/70 font-mono">GATEKEEPER</span>
+             <span className="text-sm font-bold text-emerald-100">Asset Preview</span>
+             <span className="text-[9px] text-emerald-500/60 font-mono uppercase">Visual Gatekeeper</span>
            </div>
          </div>
       </div>
 
-      <div className="flex flex-col">
-          {Array.from({ length: instanceCount }).map((_, i) => (
-              <PreviewInstanceRow 
-                  key={i} 
-                  index={i} 
-                  nodeId={id}
-                  state={previewInstances[i] || { currentMode: 'PROCEDURAL' }}
-                  edges={edges}
-                  payloadRegistry={payloadRegistry}
-                  reviewerRegistry={reviewerRegistry}
-                  psdRegistry={psdRegistry}
-                  templateRegistry={templateRegistry}
-                  globalVersion={globalVersion}
-                  onToggle={handleToggle}
-              />
-          ))}
+      <div className="flex flex-col bg-slate-950">
+         {Array.from({ length: instanceCount }).map((_, i) => (
+             <PreviewInstanceRow key={i} nodeId={id} index={i} edges={edges} />
+         ))}
       </div>
 
-      <button onClick={addInstance} className="w-full py-2 bg-slate-900 hover:bg-slate-800 text-emerald-600 hover:text-emerald-400 text-[9px] font-bold uppercase tracking-widest transition-colors flex items-center justify-center space-x-2 border-t border-emerald-900/30">
-          <LayoutGrid className="w-3 h-3" />
-          <span>Add Preview Slot</span>
+      <button 
+        onClick={addSlot}
+        className="w-full py-1.5 bg-slate-900 hover:bg-slate-800 border-t border-slate-800 text-slate-500 hover:text-slate-300 transition-colors flex items-center justify-center space-x-1"
+      >
+        <span className="text-[10px] font-bold uppercase tracking-widest">Add Preview Slot</span>
       </button>
     </div>
   );

@@ -258,7 +258,7 @@ const App: React.FC = () => {
             // STRICT PRODUCTION GATE: Only accept AssetPreview
             if (sourceNode.type !== 'assetPreview') {
                 console.error(`[PIPELINE VIOLATION] Export Gate Locked. Input must come from 'AssetPreview'. Attempted source: ${sourceNode.type}`);
-                alert("⛔ PIPELINE VIOLATION: Export requires an 'Asset Preview' sign-off. Please route your design through the Preview Node.");
+                alert("⛔ SIGN-OFF REQUIRED: Connect via 'Asset Preview' for final validation.");
                 return;
             }
         }

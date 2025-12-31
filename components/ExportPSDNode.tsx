@@ -500,7 +500,7 @@ export const ExportPSDNode = memo(({ id }: NodeProps) => {
                                   )}
                                   {isPreviewed ? (
                                       <span className="text-[8px] bg-emerald-500/20 text-emerald-300 px-1 rounded border border-emerald-500/30 leading-none">
-                                          PREVIEWED
+                                          SIGNED OFF
                                       </span>
                                   ) : isFilled ? (
                                       <span className="text-[8px] text-yellow-500 font-bold leading-none animate-pulse">
