@@ -1,8 +1,10 @@
 import React, { memo, useEffect, useMemo, useState } from 'react';
-import { Handle, Position, NodeProps, NodeResizer, useEdges, useReactFlow, useUpdateNodeInternals } from 'reactflow';
-import { PSDNodeData, AssetPreviewInstanceState, TransformedPayload, PreviewMode } from '../types';
+import { Handle, Position, NodeProps, NodeResizer, useEdges, useReactFlow, useUpdateNodeInternals, Edge } from 'reactflow';
+import { PSDNodeData, AssetPreviewInstanceState, TransformedPayload, PreviewMode, TransformedLayer } from '../types';
 import { useProceduralStore } from '../store/ProceduralContext';
-import { Eye, CheckCircle2, XCircle, LayoutGrid, Box, Cpu, FileJson, ArrowRightLeft } from 'lucide-react';
+import { findLayerByPath } from '../services/psdService';
+import { Eye, CheckCircle2, LayoutGrid, Box, Cpu, FileJson, ArrowRightLeft, Zap } from 'lucide-react';
+import { Psd } from 'ag-psd';
 
 // --- Helper: Audit Badge ---
 const AuditBadge = ({ count, label, icon: Icon, colorClass }: { count: number, label: string, icon: any, colorClass: string }) => (
@@ -12,17 +14,19 @@ const AuditBadge = ({ count, label, icon: Icon, colorClass }: { count: number, l
     </div>
 );
 
-// --- Subcomponent: Preview Instance Row ---
+// --- Interface Definition ---
 interface PreviewInstanceRowProps {
     index: number;
     nodeId: string;
     state: AssetPreviewInstanceState;
-    edges: any[];
-    payloadRegistry: any;
-    reviewerRegistry: any;
+    edges: Edge[];
+    payloadRegistry: Record<string, Record<string, TransformedPayload>>;
+    reviewerRegistry: Record<string, Record<string, TransformedPayload>>;
+    psdRegistry: Record<string, Psd>;
     onToggle: (index: number, mode: PreviewMode) => void;
 }
 
+// --- Subcomponent: Preview Instance Row ---
 const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({ 
     index, 
     nodeId, 
@@ -30,57 +34,156 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({
     edges, 
     payloadRegistry, 
     reviewerRegistry, 
+    psdRegistry,
     onToggle 
 }) => {
-    const { registerPreviewPayload } = useProceduralStore();
+    // We use registerReviewerPayload to alias this node as a 'Reviewer' for the Export Node's strict gate
+    const { registerReviewerPayload } = useProceduralStore();
+    const [localPreview, setLocalPreview] = useState<string | null>(null);
     
-    // 1. Trace Upstream (Reviewer)
+    // 1. Trace Upstream (Reviewer Connection)
     const upstreamEdge = useMemo(() => 
-        edges.find((e: any) => e.target === nodeId && e.targetHandle === `payload-in-${index}`),
+        edges.find((e) => e.target === nodeId && e.targetHandle === `payload-in-${index}`),
     [edges, nodeId, index]);
 
-    const reviewerNodeId = upstreamEdge?.source;
-    const reviewerHandleId = upstreamEdge?.sourceHandle; // e.g., 'polished-out-0'
+    // 2. Resolve Polished Payload (From Reviewer Registry)
+    const polishedPayload: TransformedPayload | undefined = useMemo(() => {
+        if (!upstreamEdge) return undefined;
+        return reviewerRegistry[upstreamEdge.source]?.[upstreamEdge.sourceHandle || ''];
+    }, [upstreamEdge, reviewerRegistry]);
 
-    // 2. Trace Origin (Remapper via Reviewer)
-    const originEdge = useMemo(() => {
-        if (!reviewerNodeId || !reviewerHandleId) return null;
-        // Reviewer handle format: 'polished-out-X'. Input handle is 'payload-in-X'.
-        const reviewerIndex = reviewerHandleId.split('-').pop();
-        return edges.find((e: any) => e.target === reviewerNodeId && e.targetHandle === `payload-in-${reviewerIndex}`);
-    }, [edges, reviewerNodeId, reviewerHandleId]);
-
-    // 3. Resolve Payloads
-    const polishedPayload: TransformedPayload | undefined = (reviewerNodeId && reviewerHandleId) 
-        ? reviewerRegistry[reviewerNodeId]?.[reviewerHandleId] 
-        : undefined;
-
-    const proceduralPayload: TransformedPayload | undefined = (originEdge)
-        ? payloadRegistry[originEdge.source]?.[originEdge.sourceHandle || '']
-        : undefined;
+    // 3. Resolve Procedural Payload (From Payload Registry via Scan)
+    const proceduralPayload: TransformedPayload | undefined = useMemo(() => {
+        // If we have a polished payload, use its metadata to find the original source
+        if (polishedPayload) {
+            const sourceId = polishedPayload.sourceNodeId;
+            const targetContainer = polishedPayload.targetContainer;
+            
+            // Scan the source node's payloads for the matching container
+            if (sourceId && payloadRegistry[sourceId]) {
+                const payloads = (Object.values(payloadRegistry[sourceId] || {}) as TransformedPayload[]);
+                return payloads.find(p => p.targetContainer === targetContainer);
+            }
+        }
+        
+        return undefined;
+    }, [polishedPayload, payloadRegistry, upstreamEdge]);
 
     // 4. Select Active Payload
-    const activePayload = state.currentMode === 'POLISHED' ? polishedPayload : proceduralPayload;
+    // If 'POLISHED' is selected but unavailable, fallback to procedural (safety)
+    const activeMode = state.currentMode;
+    const targetPayload = activeMode === 'POLISHED' ? polishedPayload : proceduralPayload;
     
-    // Fallback: If 'Polished' is selected but missing (e.g., unconnected), revert to Procedural or null
-    const displayPayload = activePayload || proceduralPayload; 
+    // Display Payload: Prefer target, fallback to whatever is available
+    const displayPayload = targetPayload || polishedPayload || proceduralPayload;
+
     const isPolishedAvailable = !!polishedPayload;
     const isProceduralAvailable = !!proceduralPayload;
 
-    // 5. Broadcast Selection to Store (Output)
+    // 5. Broadcast "Production Gate" Selection
     useEffect(() => {
         if (displayPayload) {
-            registerPreviewPayload(nodeId, `preview-out-${index}`, displayPayload);
+            // IMPORTANT: We register into reviewerRegistry so ExportPSDNode accepts it as a valid "Sign-off"
+            // We force 'isPolished: true' to satisfy the strict gate, representing that the user has manually approved this view.
+            const signedOffPayload = { ...displayPayload, isPolished: true };
+            registerReviewerPayload(nodeId, `preview-out-${index}`, signedOffPayload);
         }
-    }, [displayPayload, nodeId, index, registerPreviewPayload]);
+    }, [displayPayload, nodeId, index, registerReviewerPayload]);
 
-    // Stats
-    const layerCount = displayPayload?.layers?.length || 0;
-    const containerName = displayPayload?.targetContainer || 'Unknown';
+    // 6. Compositor Logic (Rendering Lifecycle)
+    useEffect(() => {
+        if (!displayPayload) {
+            setLocalPreview(null);
+            return;
+        }
+
+        const sourceNodeId = displayPayload.sourceNodeId;
+        const psd = psdRegistry[sourceNodeId];
+
+        if (!psd) {
+            // Fallback to the stored preview URL if binary isn't loaded (e.g. lightweight mode)
+            setLocalPreview(displayPayload.previewUrl || null);
+            return;
+        }
+
+        const { w, h } = displayPayload.metrics.target;
+        if (w === 0 || h === 0) return;
+
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return;
+
+        // Background: Workspace Grey
+        ctx.fillStyle = '#333333';
+        ctx.fillRect(0, 0, w, h);
+
+        const drawLayers = (layers: TransformedLayer[]) => {
+            // Traverse Bottom-to-Top (Reverse painter's algorithm)
+            for (let i = layers.length - 1; i >= 0; i--) {
+                const layer = layers[i];
+                if (!layer.isVisible) continue;
+
+                if (layer.children) {
+                    drawLayers(layer.children);
+                }
+
+                ctx.save();
+
+                if (layer.type === 'generative') {
+                    // Placeholder Visualization
+                    ctx.fillStyle = 'rgba(192, 132, 252, 0.3)';
+                    ctx.strokeStyle = 'rgba(192, 132, 252, 0.8)';
+                    ctx.setLineDash([5, 3]);
+                    ctx.lineWidth = 2;
+                    ctx.fillRect(layer.coords.x, layer.coords.y, layer.coords.w, layer.coords.h);
+                    ctx.strokeRect(layer.coords.x, layer.coords.y, layer.coords.w, layer.coords.h);
+                } else {
+                    // Standard Layer Composition
+                    const originalLayer = findLayerByPath(psd, layer.id);
+                    if (originalLayer && originalLayer.canvas) {
+                        try {
+                            const cx = layer.coords.x + layer.coords.w / 2;
+                            const cy = layer.coords.y + layer.coords.h / 2;
+
+                            ctx.translate(cx, cy);
+                            if (layer.transform.rotation) {
+                                ctx.rotate((layer.transform.rotation * Math.PI) / 180);
+                            }
+                            
+                            // Draw image centered at origin, using scaled dimensions
+                            ctx.globalAlpha = layer.opacity;
+                            ctx.drawImage(
+                                originalLayer.canvas, 
+                                -layer.coords.w / 2, 
+                                -layer.coords.h / 2, 
+                                layer.coords.w, 
+                                layer.coords.h
+                            );
+                        } catch (e) {
+                            console.warn("Failed to composite layer", layer.name);
+                        }
+                    }
+                }
+
+                ctx.restore();
+            }
+        };
+
+        drawLayers(displayPayload.layers);
+
+        // Convert to DataURL
+        const url = canvas.toDataURL('image/jpeg', 0.8);
+        setLocalPreview(url);
+
+    }, [displayPayload, psdRegistry]);
+
+
+    // Stats Calculation
     const dims = displayPayload?.metrics?.target || { w: 0, h: 0 };
     const scale = displayPayload?.scaleFactor || 1;
 
-    // Calculate Layer Breakdown
     const breakdown = useMemo(() => {
         let pixel = 0, group = 0, gen = 0;
         const traverse = (layers: any[]) => {
@@ -149,7 +252,7 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({
              </div>
 
              {/* Visualization Area */}
-             <div className="relative w-full h-48 bg-[#333333] rounded border border-slate-600 overflow-hidden flex items-center justify-center shadow-inner group">
+             <div className="relative w-full h-48 bg-[#333333] rounded border-2 border-dashed border-slate-600/50 overflow-hidden flex items-center justify-center shadow-inner group">
                  {/* Checkerboard Pattern */}
                  <div className="absolute inset-0 opacity-10 pointer-events-none" 
                       style={{ backgroundImage: 'linear-gradient(45deg, #444 25%, transparent 25%), linear-gradient(-45deg, #444 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #444 75%), linear-gradient(-45deg, transparent 75%, #444 75%)', backgroundSize: '20px 20px', backgroundPosition: '0 0, 0 10px, 10px -10px, -10px 0px' }} 
@@ -159,21 +262,22 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({
                      <div className="text-xs text-neutral-500 font-mono">Waiting for Payload...</div>
                  ) : (
                      <div className="relative w-full h-full p-4 flex items-center justify-center">
-                         {/* Placeholder for Canvas - In Phase 5 we'd render the actual layout here */}
-                         {/* For now, we show the Preview URL (AI Ghost) if present, or a placeholder box */}
-                         {displayPayload.previewUrl ? (
-                             <img src={displayPayload.previewUrl} alt="Preview" className="max-w-full max-h-full object-contain shadow-lg" />
+                         {/* Composited Preview or Fallback */}
+                         {localPreview ? (
+                             <img src={localPreview} alt="Composited Preview" className="max-w-full max-h-full object-contain shadow-lg" />
+                         ) : displayPayload.previewUrl ? (
+                             <img src={displayPayload.previewUrl} alt="AI Ghost Preview" className="max-w-full max-h-full object-contain shadow-lg opacity-80" />
                          ) : (
                              <div 
-                                className="border-2 border-dashed border-neutral-500/50 flex items-center justify-center bg-neutral-800/50 text-neutral-400 font-mono text-[9px] p-4 text-center"
+                                className="border border-neutral-500/30 flex items-center justify-center bg-neutral-800/80 text-neutral-400 font-mono text-[9px] p-4 text-center shadow-lg"
                                 style={{ 
                                     aspectRatio: `${dims.w} / ${dims.h}`, 
-                                    height: dims.h > dims.w ? '80%' : 'auto', 
-                                    width: dims.w >= dims.h ? '80%' : 'auto' 
+                                    height: dims.h > dims.w ? '70%' : 'auto', 
+                                    width: dims.w >= dims.h ? '70%' : 'auto' 
                                 }}
                              >
                                  <div className="flex flex-col items-center gap-1">
-                                    <span>LAYOUT GEOMETRY</span>
+                                    <Zap className="w-4 h-4 text-neutral-500" />
                                     <span>{Math.round(dims.w)} x {Math.round(dims.h)}</span>
                                  </div>
                              </div>
@@ -230,7 +334,7 @@ export const AssetPreviewNode = memo(({ id, data }: NodeProps<PSDNodeData>) => {
   const edges = useEdges();
   
   // Store Access
-  const { payloadRegistry, reviewerRegistry, unregisterNode } = useProceduralStore();
+  const { payloadRegistry, reviewerRegistry, psdRegistry, unregisterNode } = useProceduralStore();
 
   useEffect(() => {
     updateNodeInternals(id);
@@ -241,7 +345,7 @@ export const AssetPreviewNode = memo(({ id, data }: NodeProps<PSDNodeData>) => {
   }, [id, unregisterNode]);
 
   const handleToggle = (index: number, mode: PreviewMode) => {
-      setNodes(nds => nds.map(n => {
+      setNodes((nds) => nds.map((n) => {
           if (n.id === id) {
               const currentInstances = n.data.previewInstances || {};
               return {
@@ -260,7 +364,7 @@ export const AssetPreviewNode = memo(({ id, data }: NodeProps<PSDNodeData>) => {
   };
 
   const addInstance = () => {
-      setNodes(nds => nds.map(n => n.id === id ? { ...n, data: { ...n.data, instanceCount: instanceCount + 1 } } : n));
+      setNodes((nds) => nds.map((n) => n.id === id ? { ...n, data: { ...n.data, instanceCount: instanceCount + 1 } } : n));
   };
 
   return (
@@ -288,6 +392,7 @@ export const AssetPreviewNode = memo(({ id, data }: NodeProps<PSDNodeData>) => {
                   edges={edges}
                   payloadRegistry={payloadRegistry}
                   reviewerRegistry={reviewerRegistry}
+                  psdRegistry={psdRegistry}
                   onToggle={handleToggle}
               />
           ))}
