@@ -184,21 +184,21 @@ export const ExportPSDNode = memo(({ id }: NodeProps) => {
 
       const slotName = edge.targetHandle.replace('input-', '');
       
-      // PHASE 4: PRIORITY LOOKUP (Reviewer -> Error)
-      
-      // A. Check Reviewer Registry (Absolute Source of Truth)
+      // PHASE 4: STRICT PREVIEW LOOKUP
+      // AssetPreviewNode registers into reviewerRegistry with 'isPolished: true'
+      // We check reviewerRegistry for the payload coming from the AssetPreviewNode
       const reviewerData = reviewerRegistry[edge.source];
       let payload = reviewerData ? reviewerData[edge.sourceHandle || ''] : undefined;
 
-      // B. Fallback / Gate Check
+      // B. Gate Check: Detect bypass attempts
       if (!payload) {
-          // If connection exists but no reviewer data, check if it came from a legacy source (Remapper/Resolver)
-          // If found in legacy registries but NOT reviewer, it means the user bypassed the gate.
+          // If connection exists but no reviewer/preview data...
+          // Check if it's a raw Remapper or Resolver payload (Bypass Attempt)
           const isRemapper = !!payloadRegistry[edge.source]?.[edge.sourceHandle || ''];
           const isResolver = !!resolvedRegistry[edge.source]?.[edge.sourceHandle || ''];
 
           if (isRemapper || isResolver) {
-               errors.push(`Slot '${slotName}': PROCEDURAL_GATE_LOCKED. Content must be polished by Design Reviewer.`);
+               errors.push(`Slot '${slotName}': SIGN-OFF REQUIRED. Connection must come from Asset Preview Node.`);
                // Create dummy payload to render error state
                payload = {
                  status: 'error',
@@ -464,8 +464,8 @@ export const ExportPSDNode = memo(({ id }: NodeProps) => {
                   const isFilled = slotConnections.has(container.name);
                   const payload = slotConnections.get(container.name);
                   const isGen = payload?.requiresGeneration || payload?.previewUrl; 
-                  const isConfirmed = payload?.isConfirmed;
-                  const isPolished = payload?.isPolished;
+                  // isPolished (set by AssetPreview) serves as the "Previewed/Signed-off" flag
+                  const isPreviewed = payload?.isPolished;
 
                   return (
                       <div 
@@ -498,13 +498,13 @@ export const ExportPSDNode = memo(({ id }: NodeProps) => {
                                           ✨ AI
                                       </span>
                                   )}
-                                  {isPolished ? (
+                                  {isPreviewed ? (
                                       <span className="text-[8px] bg-emerald-500/20 text-emerald-300 px-1 rounded border border-emerald-500/30 leading-none">
-                                          POLISHED
+                                          PREVIEWED
                                       </span>
                                   ) : isFilled ? (
-                                      <span className="text-[8px] text-yellow-500 font-bold leading-none">
-                                          UNPOLISHED
+                                      <span className="text-[8px] text-yellow-500 font-bold leading-none animate-pulse">
+                                          UNSIGNED
                                       </span>
                                   ) : null}
                               </div>

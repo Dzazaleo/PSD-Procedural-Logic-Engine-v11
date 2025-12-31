@@ -24,6 +24,7 @@ import { DesignAnalystNode } from './components/DesignAnalystNode';
 import { ExportPSDNode } from './components/ExportPSDNode';
 import { KnowledgeNode } from './components/KnowledgeNode'; 
 import { DesignReviewerNode } from './components/DesignReviewerNode'; 
+import { AssetPreviewNode } from './components/AssetPreviewNode';
 import { ProjectControls } from './components/ProjectControls';
 import { PSDNodeData } from './types';
 import { ProceduralStoreProvider } from './store/ProceduralContext';
@@ -93,14 +94,23 @@ const initialNodes: Node<PSDNodeData>[] = [
     style: { width: 500 }
   },
   {
-    id: 'node-reviewer-1', // NEW NODE INSTANCE
+    id: 'node-reviewer-1',
     type: 'designReviewer',
-    position: { x: 2200, y: 400 }, // Positioned above export, after remapper
+    position: { x: 2200, y: 400 },
     data: { 
         fileName: null, template: null, validation: null, designLayers: null,
         instanceCount: 1 
     },
     style: { width: 480 }
+  },
+  {
+    id: 'node-preview-1', // NEW PREVIEW NODE
+    type: 'assetPreview',
+    position: { x: 2750, y: 400 },
+    data: { 
+        fileName: null, template: null, validation: null, designLayers: null,
+        instanceCount: 1 
+    }
   },
   {
     id: 'node-5',
@@ -111,7 +121,7 @@ const initialNodes: Node<PSDNodeData>[] = [
   {
     id: 'node-export-1',
     type: 'exportPsd',
-    position: { x: 2300, y: 400 }, // Shifted right to accommodate reviewer flow
+    position: { x: 3250, y: 400 }, // Shifted right for linear flow
     data: { fileName: null, template: null, validation: null, designLayers: null },
   }
 ];
@@ -119,11 +129,26 @@ const initialNodes: Node<PSDNodeData>[] = [
 const initialEdges: Edge[] = [
     { id: 'e1-2', source: 'node-1', target: 'node-2' },
     { id: 'e1-3', source: 'node-1', target: 'node-3' },
-    // Connect Target Template (Metadata Out) to Target Splitter (Template Input)
     { 
       id: 'e-target-1-5', 
       source: 'node-target-1', 
       target: 'node-5', 
+      sourceHandle: 'target-metadata-out',
+      targetHandle: 'template-input'
+    },
+    // Connect Reviewer to Preview (Default Instance 0)
+    {
+      id: 'e-reviewer-preview-0',
+      source: 'node-reviewer-1',
+      target: 'node-preview-1',
+      sourceHandle: 'polished-out-0',
+      targetHandle: 'payload-in-0'
+    },
+    // Connect Target Template to Export (to initialize Export slots)
+    {
+      id: 'e-target-export',
+      source: 'node-target-1',
+      target: 'node-export-1',
       sourceHandle: 'target-metadata-out',
       targetHandle: 'template-input'
     }
@@ -198,7 +223,7 @@ const App: React.FC = () => {
             }
         }
 
-        // Design Reviewer Validation Rules (NEW)
+        // Design Reviewer Validation Rules
         if (targetNode.type === 'designReviewer') {
             const handle = params.targetHandle || '';
 
@@ -217,12 +242,23 @@ const App: React.FC = () => {
             }
         }
 
+        // Asset Preview Validation Rules (NEW)
+        if (targetNode.type === 'assetPreview') {
+             if (params.targetHandle?.startsWith('payload-in')) {
+                 if (sourceNode.type !== 'designReviewer') {
+                     console.warn("Asset Preview requires a Design Reviewer source.");
+                     // We enforce this to ensure the full pipeline is respected, though technicall it can read remapper data via reviewer.
+                     return;
+                 }
+             }
+        }
+
         // Export Node Validation Update (PHASE 4: STRICT GATE)
         if (targetNode.type === 'exportPsd' && params.targetHandle?.startsWith('input-')) {
-            // STRICT PRODUCTION GATE: Only accept DesignReviewer
-            if (sourceNode.type !== 'designReviewer') {
-                console.error(`[PIPELINE VIOLATION] Export Gate Locked. Input must come from 'DesignReviewer'. Attempted source: ${sourceNode.type}`);
-                alert("⛔ PIPELINE ENFORCEMENT: The Export Node strictly requires a 'Design Reviewer' connection. Direct connections from Remapper or Resolvers are prohibited in Production Mode.");
+            // STRICT PRODUCTION GATE: Only accept AssetPreview
+            if (sourceNode.type !== 'assetPreview') {
+                console.error(`[PIPELINE VIOLATION] Export Gate Locked. Input must come from 'AssetPreview'. Attempted source: ${sourceNode.type}`);
+                alert("⛔ PIPELINE VIOLATION: Export requires an 'Asset Preview' sign-off. Please route your design through the Preview Node.");
                 return;
             }
         }
@@ -246,7 +282,7 @@ const App: React.FC = () => {
         return addEdge(params, cleanEdges);
       });
     },
-    [nodes, setEdges]
+    [nodes, setNodes, setEdges] // Added setNodes dependency for completeness
   );
 
   // Register custom node types
@@ -260,6 +296,7 @@ const App: React.FC = () => {
     remapper: RemapperNode,
     designAnalyst: DesignAnalystNode, 
     designReviewer: DesignReviewerNode,
+    assetPreview: AssetPreviewNode, // REGISTERED
     exportPsd: ExportPSDNode,
     knowledge: KnowledgeNode,
   }), []);
