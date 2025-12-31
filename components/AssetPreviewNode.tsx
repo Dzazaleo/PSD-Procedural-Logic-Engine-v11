@@ -3,7 +3,7 @@ import { Handle, Position, NodeProps, NodeResizer, useEdges, useReactFlow, useUp
 import { PSDNodeData, AssetPreviewInstanceState, TransformedPayload, PreviewMode, TransformedLayer, TemplateMetadata } from '../types';
 import { useProceduralStore } from '../store/ProceduralContext';
 import { findLayerByPath } from '../services/psdService';
-import { Eye, CheckCircle2, LayoutGrid, Box, Cpu, FileJson, ArrowRightLeft, Zap } from 'lucide-react';
+import { Eye, CheckCircle2, LayoutGrid, Box, Cpu, FileJson, ArrowRightLeft, Zap, Lock } from 'lucide-react';
 import { Psd } from 'ag-psd';
 
 // --- Helper: Audit Badge ---
@@ -68,6 +68,13 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({
             }
         }
         
+        // Fallback scan if polished isn't ready but connection exists
+        if (upstreamEdge && payloadRegistry[upstreamEdge.source]) {
+             // Try to find a raw payload matching the connected handle if possible, 
+             // but usually AssetPreview connects to Reviewer which connects to Remapper.
+             // We rely on the Polished payload to give us the breadcrumbs back to the raw Source ID.
+        }
+        
         return undefined;
     }, [polishedPayload, payloadRegistry, upstreamEdge]);
 
@@ -118,8 +125,9 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({
         let originY = 0;
         let foundContainer = false;
 
-        // Attempt lookup in template registry
+        // TYPE FIX: Explicitly cast the registry values to the correct type array
         const allTemplates = Object.values(templateRegistry) as TemplateMetadata[];
+        
         for (const tmpl of allTemplates) {
             const cont = tmpl.containers.find(c => c.name === displayPayload.targetContainer);
             if (cont) {
@@ -146,7 +154,7 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({
             findMin(displayPayload.layers);
             if (minX !== Infinity) originX = minX;
             if (minY !== Infinity) originY = minY;
-            console.warn("Container origin not found. Guessed:", originX, originY);
+            // console.warn("Container origin not found. Guessed:", originX, originY);
         }
 
         const canvas = document.createElement('canvas');
@@ -164,9 +172,9 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({
         ctx.translate(-originX, -originY);
 
         // DEBUG: Red Border at expected boundary
-        ctx.strokeStyle = 'rgba(255, 0, 0, 0.5)';
-        ctx.lineWidth = 2;
-        ctx.strokeRect(originX, originY, w, h);
+        // ctx.strokeStyle = 'rgba(255, 0, 0, 0.5)';
+        // ctx.lineWidth = 2;
+        // ctx.strokeRect(originX, originY, w, h);
 
         const drawLayers = (layers: TransformedLayer[]) => {
             // Traverse Bottom-to-Top (Reverse painter's algorithm)
@@ -180,11 +188,8 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({
 
                 ctx.save();
                 
-                // Debug Log
-                // console.log('Drawing Layer:', layer.id, layer.name, 'at', layer.coords.x, layer.coords.y);
-
                 if (layer.type === 'generative') {
-                    // Placeholder Visualization
+                    // Placeholder Visualization for AI layers without binary data
                     ctx.fillStyle = 'rgba(192, 132, 252, 0.3)';
                     ctx.strokeStyle = 'rgba(192, 132, 252, 0.8)';
                     ctx.setLineDash([5, 3]);
@@ -194,7 +199,6 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({
                 } else {
                     // Standard Layer Composition
                     const originalLayer = findLayerByPath(psd, layer.id);
-                    // console.log('Binary Found:', !!originalLayer);
                     
                     if (originalLayer && originalLayer.canvas) {
                         try {
@@ -299,9 +303,10 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({
                         state.currentMode === 'POLISHED' 
                             ? 'bg-emerald-600 text-white shadow-sm' 
                             : 'text-slate-500 hover:text-slate-300'
-                    } ${!isPolishedAvailable ? 'opacity-50 cursor-not-allowed' : ''}`}
+                    } ${!isPolishedAvailable ? 'opacity-40 cursor-not-allowed bg-slate-800' : ''}`}
+                    title={!isPolishedAvailable ? "Audit Pending: No polished payload available yet" : "View Final CARO Output"}
                  >
-                     <CheckCircle2 className="w-3 h-3" />
+                     {isPolishedAvailable ? <CheckCircle2 className="w-3 h-3" /> : <Lock className="w-3 h-3" />}
                      <span>Polished</span>
                  </button>
              </div>
@@ -323,6 +328,7 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({
                          ) : displayPayload.previewUrl ? (
                              <img src={displayPayload.previewUrl} alt="AI Ghost Preview" className="max-w-full max-h-full object-contain shadow-lg opacity-80" />
                          ) : (
+                             // Fallback only if both local and upstream previews are missing, but payload exists
                              <div 
                                 className="border border-neutral-500/30 flex items-center justify-center bg-neutral-800/80 text-neutral-400 font-mono text-[9px] p-4 text-center shadow-lg"
                                 style={{ 
@@ -333,7 +339,8 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({
                              >
                                  <div className="flex flex-col items-center gap-1">
                                     <Zap className="w-4 h-4 text-neutral-500" />
-                                    <span>{Math.round(dims.w)} x {Math.round(dims.h)}</span>
+                                    <span>Rendering...</span>
+                                    <span className="text-[8px] opacity-50">{Math.round(dims.w)} x {Math.round(dims.h)}</span>
                                  </div>
                              </div>
                          )}
