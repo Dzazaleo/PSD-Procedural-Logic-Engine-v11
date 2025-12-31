@@ -1,3 +1,4 @@
+
 import { Psd } from 'ag-psd';
 import { Node, Edge } from 'reactflow';
 
@@ -211,6 +212,14 @@ export interface ReviewerInstanceState {
   reviewerStrategy: ReviewerStrategy | null;
 }
 
+// --- NEW PREVIEWER TYPES ---
+export type PreviewMode = 'PROCEDURAL' | 'POLISHED';
+
+export interface AssetPreviewInstanceState {
+  currentMode: PreviewMode;
+}
+// ---------------------------
+
 export interface PSDNodeData {
   fileName: string | null;
   template: TemplateMetadata | null;
@@ -231,6 +240,7 @@ export interface PSDNodeData {
   // Multi-Instance Analysis State
   analystInstances?: Record<number, AnalystInstanceState>;
   reviewerInstances?: Record<number, ReviewerInstanceState>; // Reviewer Node State
+  previewInstances?: Record<number, AssetPreviewInstanceState>; // NEW: Preview Node State
   
   // Legacy Single-Instance Fields (Kept for backward compatibility if needed, but deprecated)
   layoutStrategy?: LayoutStrategy | null; 
