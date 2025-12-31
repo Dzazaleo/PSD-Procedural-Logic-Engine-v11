@@ -4,7 +4,7 @@ import { PSDNodeData, AssetPreviewInstanceState, TransformedPayload, PreviewMode
 import { useProceduralStore } from '../store/ProceduralContext';
 import { findLayerByPath } from '../services/psdService';
 import { Eye, CheckCircle2, LayoutGrid, Box, Cpu, FileJson, ArrowRightLeft, Zap, Lock, AlertTriangle } from 'lucide-react';
-import { Psd } from 'ag-psd';
+import { Psd, Layer } from 'ag-psd';
 
 // --- Helper: Audit Badge ---
 const AuditBadge = ({ count, label, icon: Icon, colorClass }: { count: number, label: string, icon: any, colorClass: string }) => (
@@ -13,6 +13,22 @@ const AuditBadge = ({ count, label, icon: Icon, colorClass }: { count: number, l
         <span className="text-[9px] font-mono font-bold">{count} {label}</span>
     </div>
 );
+
+// --- Helper: Recursive Pixel Search ---
+// Fallback mechanism to find pixel data by name if strict path lookups fail due to structural mutations.
+const findPixelsRecursive = (children: Layer[] | undefined, targetName: string): HTMLCanvasElement | null => {
+    if (!children) return null;
+    for (const layer of children) {
+        if (layer.name === targetName && layer.canvas) {
+            return layer.canvas as HTMLCanvasElement;
+        }
+        if (layer.children) {
+            const found = findPixelsRecursive(layer.children, targetName);
+            if (found) return found;
+        }
+    }
+    return null;
+};
 
 // --- Interface Definition ---
 interface PreviewInstanceRowProps {
@@ -47,7 +63,6 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({
     const [renderError, setRenderError] = useState<string | null>(null);
     
     // 1. Trace Upstream (Reviewer Connection)
-    // Who is feeding me? (Ideally a DesignReviewerNode)
     const upstreamEdge = useMemo(() => 
         edges.find((e) => e.target === nodeId && e.targetHandle === `payload-in-${index}`),
     [edges, nodeId, index]);
@@ -62,8 +77,6 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({
     const proceduralPayload: TransformedPayload | undefined = useMemo(() => {
         if (!upstreamEdge) return undefined;
 
-        // Heuristic: Reviewer outputs 'polished-out-X', accepts 'payload-in-X'
-        // We try to find the edge feeding the upstream node's corresponding input handle
         const upstreamInputHandle = upstreamEdge.sourceHandle?.replace('polished-out', 'payload-in');
         
         if (upstreamInputHandle) {
@@ -72,22 +85,16 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({
             );
             
             if (grandparentEdge) {
-                // Return the raw payload from the Remapper/Resolver
                 return payloadRegistry[grandparentEdge.source]?.[grandparentEdge.sourceHandle || ''];
             }
         }
         
-        // Fallback: If connected directly to Remapper (Bypassing Reviewer), upstream IS the procedural source
         return payloadRegistry[upstreamEdge.source]?.[upstreamEdge.sourceHandle || ''];
 
     }, [upstreamEdge, edges, payloadRegistry]);
 
     // 4. Select Active Payload based on State Selection
     const activeMode = state.currentMode;
-    
-    // Determine what to display based on availability
-    // If 'POLISHED' is selected but missing, fallback is NOT automatic for safety (we want to show it's missing)
-    // But for 'PROCEDURAL', we fallback to nothing.
     let displayPayload: TransformedPayload | undefined;
     
     if (activeMode === 'POLISHED') {
@@ -96,23 +103,18 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({
         displayPayload = proceduralPayload;
     }
 
-    // Availability flags for UI
     const isPolishedAvailable = !!polishedPayload;
     const isProceduralAvailable = !!proceduralPayload;
 
     // 5. Broadcast "Production Gate" Selection
-    // This pushes the VISIBLE payload to the Export Node. 
-    // The export node receives whatever the user is currently looking at.
     useEffect(() => {
         if (displayPayload) {
-            // Force 'isPolished: true' to satisfy the strict gate of ExportPSDNode, 
-            // representing that the user has manually approved THIS specific view (even if it's the procedural one).
             const signedOffPayload = { ...displayPayload, isPolished: true };
             registerReviewerPayload(nodeId, `preview-out-${index}`, signedOffPayload);
         }
     }, [displayPayload, nodeId, index, registerReviewerPayload]);
 
-    // 6. Compositor Logic (Rendering Lifecycle)
+    // 6. SURGICAL COMPOSITOR LOGIC
     useEffect(() => {
         if (!displayPayload) {
             setLocalPreview(null);
@@ -123,18 +125,14 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({
         const sourceNodeId = displayPayload.sourceNodeId;
         const psd = psdRegistry[sourceNodeId];
 
-        // Binary Safety Check
+        // BINARY READINESS GATE
+        // If the registry entry is missing (e.g. during re-upload), abort update to prevent blanking out the canvas.
         if (!psd) {
-            // If binary is missing, we might still have a previewUrl from the payload (AI Ghost)
-            // But we can't do canvas composition.
+            // Fallback: If we have an AI preview URL, display it, otherwise keep previous state if possible.
             if (displayPayload.previewUrl) {
                 setLocalPreview(displayPayload.previewUrl);
-                setRenderError(null);
-            } else {
-                setLocalPreview(null);
-                setRenderError("Binary PSD data not loaded. Please ensure LoadPSD is active.");
             }
-            return;
+            return; 
         }
 
         const { w, h } = displayPayload.metrics.target;
@@ -145,7 +143,6 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({
         let originY = 0;
         let foundContainer = false;
 
-        // TYPE FIX: Explicitly cast
         const allTemplates = Object.values(templateRegistry) as TemplateMetadata[];
         
         for (const tmpl of allTemplates) {
@@ -158,7 +155,7 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({
             }
         }
 
-        // Fallback Guess
+        // Fallback Guess logic remains same...
         if (!foundContainer && displayPayload.layers.length > 0) {
             let minX = Infinity;
             let minY = Infinity;
@@ -182,20 +179,12 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({
         const ctx = canvas.getContext('2d');
         if (!ctx) return;
 
-        // Background: Solid Dark Slate (Prevents Checkerboard Flicker)
-        ctx.fillStyle = '#0f172a'; // slate-900
+        // Background: Solid Dark Slate
+        ctx.fillStyle = '#0f172a';
         ctx.fillRect(0, 0, w, h);
 
-        ctx.save();
-        // Shift context so that (originX, originY) maps to (0,0)
-        ctx.translate(-originX, -originY);
-
-        // Debug Log
-        // const debugSet = displayPayload.layers.slice(0, 5).map(l => ({ name: l.name, x: l.coords.x, y: l.coords.y }));
-        // console.table(debugSet);
-
         const drawLayers = (layers: TransformedLayer[]) => {
-            // Traverse Bottom-to-Top
+            // Reverse Painter's Algorithm (Bottom-Up)
             for (let i = layers.length - 1; i >= 0; i--) {
                 const layer = layers[i];
                 if (!layer.isVisible) continue;
@@ -204,53 +193,66 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({
                     drawLayers(layer.children);
                 }
 
+                // --- STRICT TRANSFORMATION BANKING ---
                 ctx.save();
                 
                 if (layer.type === 'generative') {
-                    // Generative Placeholder
+                    // Normalize Coordinates relative to Origin
+                    const localX = layer.coords.x - originX;
+                    const localY = layer.coords.y - originY;
+
                     ctx.fillStyle = 'rgba(192, 132, 252, 0.2)';
                     ctx.strokeStyle = 'rgba(192, 132, 252, 0.6)';
                     ctx.setLineDash([4, 4]);
                     ctx.lineWidth = 1;
-                    ctx.fillRect(layer.coords.x, layer.coords.y, layer.coords.w, layer.coords.h);
-                    ctx.strokeRect(layer.coords.x, layer.coords.y, layer.coords.w, layer.coords.h);
+                    ctx.fillRect(localX, localY, layer.coords.w, layer.coords.h);
+                    ctx.strokeRect(localX, localY, layer.coords.w, layer.coords.h);
                 } else {
-                    // Standard Layer Composition
-                    const originalLayer = findLayerByPath(psd, layer.id);
-                    
-                    if (originalLayer && originalLayer.canvas) {
-                        try {
-                            const cx = layer.coords.x + layer.coords.w / 2;
-                            const cy = layer.coords.y + layer.coords.h / 2;
+                    // 1. Primary Lookup: Path ID (Fastest)
+                    const directLayer = findLayerByPath(psd, layer.id);
+                    let pixelSource: HTMLCanvasElement | null = null;
 
-                            ctx.translate(cx, cy);
-                            if (layer.transform.rotation) {
-                                ctx.rotate((layer.transform.rotation * Math.PI) / 180);
-                            }
-                            
-                            ctx.globalAlpha = layer.opacity;
-                            // Draw image centered
-                            ctx.drawImage(
-                                originalLayer.canvas, 
-                                -layer.coords.w / 2, 
-                                -layer.coords.h / 2, 
-                                layer.coords.w, 
-                                layer.coords.h
-                            );
-                        } catch (e) {
-                            console.warn("Failed to composite layer", layer.name);
-                        }
+                    if (directLayer && directLayer.canvas) {
+                        pixelSource = directLayer.canvas as HTMLCanvasElement;
                     } else {
-                        // FALLBACK: Wireframe for missing binary data
-                        ctx.strokeStyle = '#d946ef'; // Magenta-500
-                        ctx.lineWidth = 1;
-                        ctx.strokeRect(layer.coords.x, layer.coords.y, layer.coords.w, layer.coords.h);
+                        // 2. Fallback Lookup: Recursive Name Search (Robustness for partial structure matches)
+                        pixelSource = findPixelsRecursive(psd.children, layer.name);
+                    }
+
+                    if (pixelSource) {
+                        // Normalization & Transform Application
+                        ctx.globalAlpha = layer.opacity;
                         
-                        // Only draw text if it's big enough
-                        if (layer.coords.h > 10) {
-                            ctx.fillStyle = '#d946ef';
-                            ctx.font = '10px monospace';
-                            ctx.fillText(layer.name.substring(0, 10), layer.coords.x + 2, layer.coords.y + 10);
+                        // Move context to where the top-left of the layer should be
+                        ctx.translate(layer.coords.x - originX, layer.coords.y - originY);
+                        
+                        if (layer.transform.rotation) {
+                            // Rotate around center? No, standard CSS/Canvas transform usually assumes top-left unless offset.
+                            // However, our data model usually stores top-left.
+                            // For simple rotation, we rotate around the center of the object.
+                            const cx = layer.coords.w / 2;
+                            const cy = layer.coords.h / 2;
+                            ctx.translate(cx, cy);
+                            ctx.rotate((layer.transform.rotation * Math.PI) / 180);
+                            ctx.translate(-cx, -cy);
+                        }
+
+                        // Draw at (0,0) relative to the translated context
+                        ctx.drawImage(pixelSource, 0, 0, layer.coords.w, layer.coords.h);
+                    } else {
+                        // 3. Debug Wireframe (Missing Pixels)
+                        const localX = layer.coords.x - originX;
+                        const localY = layer.coords.y - originY;
+                        
+                        ctx.strokeStyle = '#fbbf24'; // Amber-400
+                        ctx.lineWidth = 1;
+                        ctx.setLineDash([2, 2]);
+                        ctx.strokeRect(localX, localY, layer.coords.w, layer.coords.h);
+                        
+                        if (layer.coords.h > 12) {
+                            ctx.fillStyle = '#fbbf24';
+                            ctx.font = '9px monospace';
+                            ctx.fillText(`[MISSING: ${layer.name.substring(0, 10)}]`, localX + 2, localY + 10);
                         }
                     }
                 }
@@ -260,9 +262,8 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({
         };
 
         drawLayers(displayPayload.layers);
-        ctx.restore(); 
 
-        const url = canvas.toDataURL('image/jpeg', 0.85);
+        const url = canvas.toDataURL('image/jpeg', 0.9);
         setLocalPreview(url);
         setRenderError(null);
 
