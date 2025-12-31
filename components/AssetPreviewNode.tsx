@@ -1,6 +1,6 @@
 import React, { memo, useEffect, useMemo, useState } from 'react';
 import { Handle, Position, NodeProps, NodeResizer, useEdges, useReactFlow, useUpdateNodeInternals, Edge } from 'reactflow';
-import { PSDNodeData, AssetPreviewInstanceState, TransformedPayload, PreviewMode, TransformedLayer } from '../types';
+import { PSDNodeData, AssetPreviewInstanceState, TransformedPayload, PreviewMode, TransformedLayer, TemplateMetadata } from '../types';
 import { useProceduralStore } from '../store/ProceduralContext';
 import { findLayerByPath } from '../services/psdService';
 import { Eye, CheckCircle2, LayoutGrid, Box, Cpu, FileJson, ArrowRightLeft, Zap } from 'lucide-react';
@@ -23,6 +23,7 @@ interface PreviewInstanceRowProps {
     payloadRegistry: Record<string, Record<string, TransformedPayload>>;
     reviewerRegistry: Record<string, Record<string, TransformedPayload>>;
     psdRegistry: Record<string, Psd>;
+    templateRegistry: Record<string, TemplateMetadata>;
     onToggle: (index: number, mode: PreviewMode) => void;
 }
 
@@ -35,6 +36,7 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({
     payloadRegistry, 
     reviewerRegistry, 
     psdRegistry,
+    templateRegistry,
     onToggle 
 }) => {
     // We use registerReviewerPayload to alias this node as a 'Reviewer' for the Export Node's strict gate
@@ -109,6 +111,44 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({
         const { w, h } = displayPayload.metrics.target;
         if (w === 0 || h === 0) return;
 
+        // --- COORDINATE NORMALIZATION ---
+        // Layers have absolute coordinates relative to the full PSD.
+        // We must subtract the Target Container's origin to render them onto this local canvas (0,0).
+        let originX = 0;
+        let originY = 0;
+        let foundContainer = false;
+
+        // Attempt lookup in template registry
+        const allTemplates = Object.values(templateRegistry) as TemplateMetadata[];
+        for (const tmpl of allTemplates) {
+            const cont = tmpl.containers.find(c => c.name === displayPayload.targetContainer);
+            if (cont) {
+                originX = cont.bounds.x;
+                originY = cont.bounds.y;
+                foundContainer = true;
+                break;
+            }
+        }
+
+        // Fallback: If metadata missing, guess origin from layer bounds
+        if (!foundContainer && displayPayload.layers.length > 0) {
+            let minX = Infinity;
+            let minY = Infinity;
+            const findMin = (layers: TransformedLayer[]) => {
+                layers.forEach(l => {
+                    if (l.isVisible) {
+                        if (l.coords.x < minX) minX = l.coords.x;
+                        if (l.coords.y < minY) minY = l.coords.y;
+                        if (l.children) findMin(l.children);
+                    }
+                });
+            };
+            findMin(displayPayload.layers);
+            if (minX !== Infinity) originX = minX;
+            if (minY !== Infinity) originY = minY;
+            console.warn("Container origin not found. Guessed:", originX, originY);
+        }
+
         const canvas = document.createElement('canvas');
         canvas.width = w;
         canvas.height = h;
@@ -118,6 +158,15 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({
         // Background: Workspace Grey
         ctx.fillStyle = '#333333';
         ctx.fillRect(0, 0, w, h);
+
+        ctx.save();
+        // Shift context so that (originX, originY) maps to (0,0)
+        ctx.translate(-originX, -originY);
+
+        // DEBUG: Red Border at expected boundary
+        ctx.strokeStyle = 'rgba(255, 0, 0, 0.5)';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(originX, originY, w, h);
 
         const drawLayers = (layers: TransformedLayer[]) => {
             // Traverse Bottom-to-Top (Reverse painter's algorithm)
@@ -130,6 +179,9 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({
                 }
 
                 ctx.save();
+                
+                // Debug Log
+                // console.log('Drawing Layer:', layer.id, layer.name, 'at', layer.coords.x, layer.coords.y);
 
                 if (layer.type === 'generative') {
                     // Placeholder Visualization
@@ -142,6 +194,8 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({
                 } else {
                     // Standard Layer Composition
                     const originalLayer = findLayerByPath(psd, layer.id);
+                    // console.log('Binary Found:', !!originalLayer);
+                    
                     if (originalLayer && originalLayer.canvas) {
                         try {
                             const cx = layer.coords.x + layer.coords.w / 2;
@@ -172,12 +226,13 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({
         };
 
         drawLayers(displayPayload.layers);
+        ctx.restore(); // Restore translation
 
         // Convert to DataURL
         const url = canvas.toDataURL('image/jpeg', 0.8);
         setLocalPreview(url);
 
-    }, [displayPayload, psdRegistry]);
+    }, [displayPayload, psdRegistry, templateRegistry]);
 
 
     // Stats Calculation
@@ -334,7 +389,7 @@ export const AssetPreviewNode = memo(({ id, data }: NodeProps<PSDNodeData>) => {
   const edges = useEdges();
   
   // Store Access
-  const { payloadRegistry, reviewerRegistry, psdRegistry, unregisterNode } = useProceduralStore();
+  const { payloadRegistry, reviewerRegistry, psdRegistry, templateRegistry, unregisterNode } = useProceduralStore();
 
   useEffect(() => {
     updateNodeInternals(id);
@@ -393,6 +448,7 @@ export const AssetPreviewNode = memo(({ id, data }: NodeProps<PSDNodeData>) => {
                   payloadRegistry={payloadRegistry}
                   reviewerRegistry={reviewerRegistry}
                   psdRegistry={psdRegistry}
+                  templateRegistry={templateRegistry}
                   onToggle={handleToggle}
               />
           ))}
