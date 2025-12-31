@@ -3,13 +3,26 @@ import { Handle, Position, NodeProps, useEdges, useReactFlow } from 'reactflow';
 import { PSDNodeData, TransformedPayload, TransformedLayer, TemplateMetadata } from '../types';
 import { useProceduralStore } from '../store/ProceduralContext';
 import { findLayerByPath } from '../services/psdService';
-import { Eye, CheckCircle2, Zap, Scan, Layers } from 'lucide-react';
+import { Eye, CheckCircle2, Zap, Scan, Layers, AlertTriangle } from 'lucide-react';
 
 interface PreviewInstanceRowProps {
   nodeId: string;
   index: number;
   edges: any[];
 }
+
+// --- Helper: Deep Leaf Counter ---
+const countDeepLeaves = (layers: TransformedLayer[]): number => {
+    let count = 0;
+    layers.forEach(l => {
+        if (l.children) {
+            count += countDeepLeaves(l.children);
+        } else {
+            count++;
+        }
+    });
+    return count;
+};
 
 const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({ nodeId, index, edges }) => {
   const [viewMode, setViewMode] = useState<'PROCEDURAL' | 'POLISHED'>('PROCEDURAL');
@@ -45,17 +58,28 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({ nodeId, index, 
   // 4. Broadcast Selection
   useEffect(() => {
     if (displayPayload) {
-      registerReviewerPayload(nodeId, `preview-out-${index}`, { ...displayPayload, isPolished: true });
+      registerReviewerPayload(nodeId, `preview-out-${index}`, displayPayload);
     }
   }, [displayPayload, nodeId, index, registerReviewerPayload]);
 
-  // 5. AUTO-FRAMING COMPOSITOR
+  // 5. "FINAL SIGN-OFF" COMPOSITOR
   useEffect(() => {
     if (!displayPayload) return;
 
-    console.log("[Preview] Starting render for:", displayPayload.targetContainer, "Source Node:", displayPayload.sourceNodeId);
+    // BINARY RECOVERY LOGIC:
+    // The payload.sourceNodeId often points to a Remapper/Reviewer which has no binary data.
+    // We must find the original 'LoadPSD' source.
+    // Strategy: Look up specific ID first, then fallback to scanning the registry for ANY valid PSD.
+    let sourcePsd = psdRegistry[displayPayload.sourceNodeId];
+    
+    if (!sourcePsd) {
+        const firstAvailableKey = Object.keys(psdRegistry)[0];
+        if (firstAvailableKey) {
+            sourcePsd = psdRegistry[firstAvailableKey];
+            // console.log(`[Preview] Binary recovery: Used fallback ${firstAvailableKey} for pixels.`);
+        }
+    }
 
-    const sourcePsd = psdRegistry[displayPayload.sourceNodeId];
     const { w, h } = displayPayload.metrics.target;
     
     const canvas = document.createElement('canvas');
@@ -64,16 +88,18 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({ nodeId, index, 
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    // A. Background (Dark Slate)
+    // A. Background (Dark Slate for Contrast)
     ctx.fillStyle = '#0f172a';
     ctx.fillRect(0, 0, w, h);
 
-    // B. Calculate Origin (The "Camera" Position)
+    // B. TARGET SPACE NORMALIZATION
+    // The canvas represents the Target Container. 
+    // We must subtract the Container's Global Origin from every Layer's Global Coordinate.
     let originX = 0;
     let originY = 0;
     let originFound = false;
 
-    // Strategy 1: Metadata Lookup (Case-Insensitive)
+    // Search all templates for this container definition
     const allTemplates = Object.values(templateRegistry) as TemplateMetadata[];
     for (const tmpl of allTemplates) {
         const container = tmpl.containers.find(c => 
@@ -87,49 +113,48 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({ nodeId, index, 
         }
     }
 
-    // Strategy 2: Auto-Frame (Fallback)
-    // If metadata fails, find the top-leftmost layer and use that as the origin anchor
+    // Fallback: If metadata is missing, Auto-Frame to the top-leftmost layer
     if (!originFound && displayPayload.layers.length > 0) {
         let minX = Infinity;
         let minY = Infinity;
-        
         const scanLayers = (layers: TransformedLayer[]) => {
             layers.forEach(l => {
-                if (l.coords.x < minX) minX = l.coords.x;
-                if (l.coords.y < minY) minY = l.coords.y;
-                if (l.children) scanLayers(l.children);
+                if (l.isVisible) {
+                    if (l.coords.x < minX) minX = l.coords.x;
+                    if (l.coords.y < minY) minY = l.coords.y;
+                    if (l.children) scanLayers(l.children);
+                }
             });
         };
         scanLayers(displayPayload.layers);
-        
         if (minX !== Infinity) {
             originX = minX;
             originY = minY;
-            console.warn(`[AssetPreview] Metadata lookup failed for ${displayPayload.targetContainer}. Auto-framed to ${minX}, ${minY}`);
         }
     }
 
-    // Debug Grid
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
-    ctx.beginPath();
-    ctx.moveTo(0, 0); ctx.lineTo(w, h);
-    ctx.moveTo(w, 0); ctx.lineTo(0, h);
-    ctx.stroke();
-
-    // C. Draw Loop
+    // C. DEEP RENDER TRAVERSAL
     const drawLayers = (layers: TransformedLayer[]) => {
-        // Bottom-up traversal
+        // Iterate BACKWARDS (length-1 to 0) to simulate Painter's Algorithm (Bottom Layers First)
+        // Assumption: 'layers' array is ordered [Top ... Bottom] (Photoshop standard)
         for (let i = layers.length - 1; i >= 0; i--) {
             const layer = layers[i];
             
             if (layer.isVisible) {
-                // Shift Global Coordinates to Local Canvas Space
+                // If group, recurse immediately (don't draw the group folder itself)
+                if (layer.children && layer.children.length > 0) {
+                    drawLayers(layer.children);
+                    continue; 
+                }
+
+                // --- Drawing Leaf Node ---
+                // Calculate Local Coordinates relative to the Target Container
                 const localX = layer.coords.x - originX;
                 const localY = layer.coords.y - originY;
 
                 ctx.save();
                 
-                // 1. Generative Placeholder
+                // 1. Generative/Synthetic Placeholder
                 if (layer.type === 'generative') {
                     ctx.fillStyle = 'rgba(192, 132, 252, 0.2)'; // Purple
                     ctx.strokeStyle = '#c084fc';
@@ -137,7 +162,7 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({ nodeId, index, 
                     ctx.fillRect(localX, localY, layer.coords.w, layer.coords.h);
                     ctx.strokeRect(localX, localY, layer.coords.w, layer.coords.h);
                 } 
-                // 2. Pixel Layer
+                // 2. Real Pixel Data
                 else if (sourcePsd) {
                     const originalLayer = findLayerByPath(sourcePsd, layer.id);
 
@@ -153,8 +178,9 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({ nodeId, index, 
                              ctx.translate(-cx, -cy);
                         }
 
-                        // Draw Image
                         try {
+                            // Draw Image scaled to the Layer's Current Dimensions
+                            // This preserves the Remapper's scaling logic visually
                             ctx.drawImage(
                                 originalLayer.canvas, 
                                 localX, 
@@ -162,20 +188,16 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({ nodeId, index, 
                                 layer.coords.w, 
                                 layer.coords.h
                             );
-                        } catch (e) { /* Ignore empty canvas errors */ }
+                        } catch (e) { /* Ignore canvas read errors */ }
                     } else {
-                        // Binary Missing Indicator
+                        // Binary Missing Indicator (Wireframe)
                         ctx.strokeStyle = '#ef4444'; // Red
-                        ctx.lineWidth = 2;
+                        ctx.lineWidth = 1;
                         ctx.strokeRect(localX, localY, layer.coords.w, layer.coords.h);
                     }
                 }
 
                 ctx.restore();
-
-                if (layer.children) {
-                    drawLayers(layer.children);
-                }
             }
         }
     };
@@ -184,10 +206,15 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({ nodeId, index, 
         drawLayers(displayPayload.layers);
     }
 
-    // D. Finalize
-    setLocalPreview(canvas.toDataURL('image/jpeg', 0.85));
+    setLocalPreview(canvas.toDataURL('image/jpeg', 0.9));
 
   }, [displayPayload, psdRegistry, templateRegistry, globalVersion]);
+
+  // Deep Count for UI
+  const leafCount = useMemo(() => {
+      if (!displayPayload?.layers) return 0;
+      return countDeepLeaves(displayPayload.layers);
+  }, [displayPayload]);
 
   return (
     <div className="relative border-b border-emerald-900/30 bg-slate-950/50 p-3 space-y-3">
@@ -230,7 +257,6 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({ nodeId, index, 
 
         {/* Canvas Stage */}
         <div className="relative w-full aspect-video bg-[#0f172a] rounded border border-slate-700/50 overflow-hidden flex items-center justify-center group">
-            {/* Checkerboard */}
             <div className="absolute inset-0 opacity-10 pointer-events-none" 
                  style={{ backgroundImage: 'radial-gradient(#334155 1px, transparent 1px)', backgroundSize: '10px 10px' }}>
             </div>
@@ -260,7 +286,7 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({ nodeId, index, 
         <div className="flex items-center justify-between px-1">
             <div className="flex items-center space-x-2 text-[9px] text-slate-500 font-mono">
                 <Layers className="w-3 h-3" />
-                <span>{displayPayload?.layers.length || 0} Objects</span>
+                <span>{leafCount} Objects</span>
             </div>
             
             <div className="relative">
@@ -279,7 +305,7 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({ nodeId, index, 
             type="target" 
             position={Position.Left} 
             id={`payload-in-${index}`} 
-            className="!absolute !left-[-8px] !top-1/2 !-translate-y-1/2 !w-3 !h-3 !bg-indigo-500 !border-2 !border-slate-900 z-50" 
+            className="!absolute !left-[-8px] !top-12 !w-3 !h-3 !bg-indigo-500 !border-2 !border-slate-900 z-50" 
         />
     </div>
   );
